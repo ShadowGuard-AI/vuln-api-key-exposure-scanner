@@ -12,6 +12,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 def _mask_value(value):
     """Masked preview only: first 4 characters plus a short hash."""
     digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:8]
+    # The first four characters stay in clear. For the private key
+    # headers that is only dashes and letters of a fixed string, but a
+    # custom pattern whose whole match is four characters or shorter
+    # prints its entire match here, followed by a redaction tag.
     return f"{value[:4]}...[REDACTED sha256:{digest}]"
 
 
@@ -99,6 +103,9 @@ class APIKeyScanner:
                 match = re.search(pattern, line)
                 if match:
                     raw = match.group(0).strip()
+                    # re.search keeps one match per pattern per line. A line holding two
+                    # different keys that fit the same pattern reports the first only,
+                    # so a clean second key on a busy line is never listed.
                     matches.append({"line": i + 1, "pattern": name, "match_masked": _mask_value(raw)})
         return matches
 
@@ -116,6 +123,11 @@ class APIKeyScanner:
         exclude_abs = [os.path.abspath(p) for p in self.exclude_paths]
         # Also resolve exclude entries given relative to the scanned tree.
         for p in self.exclude_paths:
+            # Every exclude entry is resolved twice, once against the working
+            # directory and once against the scanned tree, and both forms
+            # exclude. The same string can therefore silence two different
+            # directories in one run. Neither form resolves symlinks, so
+            # excluding through a linked path does not match the real one.
             candidate = os.path.abspath(os.path.join(directory_path, p))
             if candidate not in exclude_abs:
                 exclude_abs.append(candidate)
@@ -133,9 +145,16 @@ class APIKeyScanner:
                 file_path = os.path.join(root, file)
 
                 # Check file type if specified
+                # This is a suffix test, not an extension test: the argument py
+                # matches a file named scrapy, and .PY never matches .py because
+                # the comparison is case sensitive.
                 if self.file_types and not any(file.endswith(ext) for ext in self.file_types):
                     continue
 
+                # scan_file has no error handling of its own now, so one file that
+                # vanishes mid walk or refuses to open ends the whole directory
+                # scan through the handler in main. Nothing records how far the
+                # walk got before it failed.
                 matches = self.scan_file(file_path)
                 if matches:
                     results[file_path] = matches
