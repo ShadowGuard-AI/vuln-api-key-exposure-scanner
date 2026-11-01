@@ -3,15 +3,22 @@ import re
 import os
 import logging
 import sys
-import requests
+import hashlib
 import json  # For handling JSON data if needed
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def _mask_value(value):
+    """Masked preview only: first 4 characters plus a short hash."""
+    digest = hashlib.sha256(value.encode("utf-8", "ignore")).hexdigest()[:8]
+    return f"{value[:4]}...[REDACTED sha256:{digest}]"
+
+
 class APIKeyScanner:
     """
-    A class to scan files, directories, and network traffic dumps for exposed API keys and secrets.
+    A class to scan local files and directories for exposed API keys and secrets.
+    It does not scan network traffic.
     """
 
     def __init__(self, target, file_types=None, regex_patterns=None, exclude_paths=None):
@@ -19,7 +26,7 @@ class APIKeyScanner:
         Initializes the APIKeyScanner.
 
         Args:
-            target (str): The target path (file, directory, or network traffic dump).
+            target (str): The target path (a local file or directory).
             file_types (list, optional): List of file extensions to scan. Defaults to None (all files).
             regex_patterns (list, optional): List of regex patterns to use for key detection. Defaults to common patterns.
             exclude_paths (list, optional): List of paths to exclude from the scan. Defaults to None.
@@ -27,8 +34,20 @@ class APIKeyScanner:
 
         self.target = target
         self.file_types = file_types
-        self.regex_patterns = regex_patterns or self._default_regex_patterns()  # Use default patterns if none provided
+        if regex_patterns:
+            self.regex_patterns = list(regex_patterns)
+            self.pattern_names = [f"custom_pattern_{i + 1}" for i in range(len(self.regex_patterns))]
+        else:
+            named = self._default_regex_patterns()
+            self.pattern_names = [name for name, _ in named]
+            self.regex_patterns = [pat for _, pat in named]
+        for pat in self.regex_patterns:
+            try:
+                re.compile(pat)
+            except re.error as e:
+                raise ValueError(f"Invalid regex pattern {pat!r}: {e}")
         self.exclude_paths = exclude_paths or []
+        self.files_scanned = 0
 
         # Input validation
         if not isinstance(self.target, str):
@@ -45,20 +64,18 @@ class APIKeyScanner:
         Returns a list of default regex patterns for common API keys and secrets.
         """
         return [
-            r"(?i)AKIA[0-9A-Z]{16}",  # AWS API Key
-            r"(?i)secret_key=[\"']?[0-9a-zA-Z+/=]{40}[\"']?",  # Secret key
-            r"(?i)api_key=[\"']?[0-9a-zA-Z]{32}[\"']?", # Generic API Key with 32 chars
-            r"(?i)api_key=[\"']?[0-9a-zA-Z]{40}[\"']?", # Generic API Key with 40 chars
-            r"(?i)API_KEY=[\"']?[0-9a-zA-Z]{32}[\"']?", # Generic API Key with 32 chars - uppercase
-            r"(?i)API_KEY=[\"']?[0-9a-zA-Z]{40}[\"']?", # Generic API Key with 40 chars - uppercase
-            r"(?i)-----BEGIN RSA PRIVATE KEY-----", # RSA Private Key
-            r"(?i)-----BEGIN PGP PRIVATE KEY BLOCK-----", # PGP Private Key
-            r"(?i)-----BEGIN OPENSSH PRIVATE KEY-----", # OpenSSH Private Key
-            r"sk-[a-zA-Z0-9]{32,}",  # OpenAI API keys
-            r"AIzaSy[a-zA-Z0-9_-]{35}", # Google Cloud API Key
-            r"[a-zA-Z0-9_-]{32}.[a-zA-Z0-9_-]{59}", # Firebase JWT secret
-            r"xoxb-[0-9]{11}-[0-9]{12}", # Slack Bot Token
-            r"ghp_[a-zA-Z0-9]{36}", # GitHub Personal Access Token
+            ("aws_access_key", r"(?i)AKIA[0-9A-Z]{16}"),
+            ("secret_key", r"(?i)secret_key=[\"']?[0-9a-zA-Z+/=]{40}[\"']?"),
+            ("generic_api_key_32", r"(?i)api_key=[\"']?[0-9a-zA-Z]{32}[\"']?"),
+            ("generic_api_key_40", r"(?i)api_key=[\"']?[0-9a-zA-Z]{40}[\"']?"),
+            ("rsa_private_key", r"(?i)-----BEGIN RSA PRIVATE KEY-----"),
+            ("pgp_private_key", r"(?i)-----BEGIN PGP PRIVATE KEY BLOCK-----"),
+            ("openssh_private_key", r"(?i)-----BEGIN OPENSSH PRIVATE KEY-----"),
+            ("openai_api_key", r"sk-[a-zA-Z0-9]{32,}"),
+            ("google_cloud_api_key", r"AIzaSy[a-zA-Z0-9_-]{35}"),
+            ("firebase_key", r"\b[a-zA-Z0-9_-]{32}\.[a-zA-Z0-9_-]{59}\b"),
+            ("slack_bot_token", r"xoxb-[0-9]{11}-[0-9]{12}"),
+            ("github_personal_access_token", r"ghp_[a-zA-Z0-9]{36}"),
         ]
 
     def scan_file(self, file_path):
@@ -72,22 +89,17 @@ class APIKeyScanner:
             list: A list of tuples, where each tuple contains the line number and the matched string.
         """
 
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-        except FileNotFoundError:
-            logging.error(f"File not found: {file_path}")
-            return []
-        except Exception as e:
-            logging.error(f"Error reading file {file_path}: {e}")
-            return []
+        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        self.files_scanned += 1
 
         matches = []
         for i, line in enumerate(lines):
-            for pattern in self.regex_patterns:
+            for name, pattern in zip(self.pattern_names, self.regex_patterns):
                 match = re.search(pattern, line)
                 if match:
-                    matches.append((i + 1, match.group(0).strip()))  # Line number and matched string
+                    raw = match.group(0).strip()
+                    matches.append({"line": i + 1, "pattern": name, "match_masked": _mask_value(raw)})
         return matches
 
     def scan_directory(self, directory_path):
@@ -101,10 +113,20 @@ class APIKeyScanner:
             dict: A dictionary where keys are file paths and values are lists of matches (line number, matched string).
         """
         results = {}
-        for root, _, files in os.walk(directory_path):
-            # Exclude specified paths
-            if any(os.path.join(root, x).startswith(os.path.abspath(exclude_path)) for exclude_path in self.exclude_paths):
-                logging.debug(f"Skipping excluded path: {root}")
+        exclude_abs = [os.path.abspath(p) for p in self.exclude_paths]
+        # Also resolve exclude entries given relative to the scanned tree.
+        for p in self.exclude_paths:
+            candidate = os.path.abspath(os.path.join(directory_path, p))
+            if candidate not in exclude_abs:
+                exclude_abs.append(candidate)
+
+        def _excluded(path):
+            ap = os.path.abspath(path)
+            return any(ap == ex or ap.startswith(ex + os.sep) for ex in exclude_abs)
+
+        for root, dirs, files in os.walk(directory_path):
+            dirs[:] = [d for d in dirs if not _excluded(os.path.join(root, d))]
+            if _excluded(root):
                 continue
 
             for file in files:
@@ -121,50 +143,32 @@ class APIKeyScanner:
 
     def scan_network_traffic(self, traffic_file_path):
         """
-        Scans a network traffic dump (e.g., PCAP file) for API keys and secrets.
-        This is a placeholder and requires specialized libraries like dpkt or scapy to process network packets.
-
-        Args:
-            traffic_file_path (str): The path to the network traffic dump file.
-
-        Returns:
-            dict: A dictionary where keys are packet numbers and values are lists of matches (matched string).
-                   Returns an empty dictionary if the functionality is not fully implemented.
+        Network traffic scanning is not implemented. This tool scans
+        local files and directories only.
         """
-        logging.warning("Network traffic scanning is a placeholder and requires further implementation.")
-        logging.warning("You need to implement packet parsing and content analysis using libraries like dpkt or scapy.")
-        # In a real implementation, you would:
-        # 1. Parse the PCAP file using dpkt or scapy
-        # 2. Iterate through each packet
-        # 3. Extract the payload (HTTP requests/responses, etc.)
-        # 4. Apply the regex patterns to the payload
-        # 5. Store the results in a dictionary
-
-        return {} # Placeholder return.
+        raise NotImplementedError("Network traffic scanning is not implemented; this tool scans local files and directories only.")
 
     def scan(self):
         """
-        Scans the target (file, directory, or network traffic dump) for API keys and secrets.
+        Scans the target (a local file or directory) for API keys and secrets.
 
         Returns:
-            dict: Results of the scan.  The structure depends on the target type.
+            dict: Results of the scan.
+
+        Raises:
+            FileNotFoundError: when the target does not exist.
+            Exception: any scan failure propagates instead of being
+            folded into an empty, clean-looking result.
         """
-        try:
-            if os.path.isfile(self.target):
-                logging.info(f"Scanning file: {self.target}")
-                results = {self.target: self.scan_file(self.target)}
-            elif os.path.isdir(self.target):
-                logging.info(f"Scanning directory: {self.target}")
-                results = self.scan_directory(self.target)
-            else:
-                logging.error(f"Target is not a valid file or directory: {self.target}")
-                return {}
-
-            return results
-
-        except Exception as e:
-            logging.error(f"An error occurred during the scan: {e}")
-            return {}
+        if os.path.isfile(self.target):
+            logging.info(f"Scanning file: {self.target}")
+            results = {self.target: self.scan_file(self.target)}
+        elif os.path.isdir(self.target):
+            logging.info(f"Scanning directory: {self.target}")
+            results = self.scan_directory(self.target)
+        else:
+            raise FileNotFoundError(f"Target is not a valid file or directory: {self.target}")
+        return results
 
 def setup_argparse():
     """
@@ -173,8 +177,8 @@ def setup_argparse():
     Returns:
         argparse.ArgumentParser: The argument parser.
     """
-    parser = argparse.ArgumentParser(description="Scans files, directories, or network traffic dumps for exposed API keys and secrets.")
-    parser.add_argument("target", help="The target file, directory, or network traffic dump to scan.")
+    parser = argparse.ArgumentParser(description="Scans local files and directories for exposed API keys and secrets. It does not scan network traffic.")
+    parser.add_argument("target", help="The target local file or directory to scan.")
     parser.add_argument("-f", "--file-types", nargs="+", help="List of file extensions to scan (e.g., .txt .py .js). If not specified, all files are scanned in a directory.")
     parser.add_argument("-e", "--exclude", nargs="+", help="List of paths to exclude from the scan (directories).")
     parser.add_argument("-o", "--output", help="Output file to write results to (JSON format).")
@@ -196,30 +200,34 @@ def main():
     try:
         scanner = APIKeyScanner(args.target, file_types=args.file_types, exclude_paths=args.exclude, regex_patterns=args.patterns)
         results = scanner.scan()
-
-        if results:
-            print("Scan results:")
-            for file_path, matches in results.items():
-                if matches:
-                    print(f"  File: {file_path}")
-                    for line_number, match in matches:
-                        print(f"    Line {line_number}: {match}")
-                else:
-                    logging.debug(f"No matches found in {file_path}") # Only log if verbose mode enabled.
-        else:
-            print("No API keys or secrets found.")
-
-        # Output to file if specified
-        if args.output:
-            try:
-                with open(args.output, 'w') as outfile:
-                    json.dump(results, outfile, indent=4)
-                print(f"Results written to {args.output}")
-            except Exception as e:
-                logging.error(f"Error writing results to file: {e}")
     except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
+        logging.error(f"Scan failed: {e}")
+        print("Scan not performed or failed. No clean verdict issued.")
         sys.exit(1)
+
+    if scanner.files_scanned == 0:
+        print("Scan not performed: no files were read. No clean verdict issued.")
+        sys.exit(2)
+
+    total = sum(len(m) for m in results.values())
+    if total:
+        print("Scan results:")
+        for file_path, matches in results.items():
+            if matches:
+                print(f"  File: {file_path}")
+                for entry in matches:
+                    print(f"    Line {entry['line']}: pattern={entry['pattern']} match={entry['match_masked']}")
+    else:
+        print("No API keys or secrets found.")
+
+    if args.output:
+        try:
+            with open(args.output, 'w') as outfile:
+                json.dump(results, outfile, indent=4)
+            print(f"Results written to {args.output}")
+        except Exception as e:
+            logging.error(f"Error writing results to file: {e}")
+            sys.exit(1)
 
 
 if __name__ == "__main__":
